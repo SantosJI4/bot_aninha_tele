@@ -1,0 +1,7 @@
+node_modules
+stickers
+.env
+db.json
+.wwebjs_auth
+.wwebjs_cache
+produtos/cybersecurity/kdenlive-26.04.1.exe
