@@ -1,11 +1,14 @@
 import os
 import sqlite3
 import logging
+import asyncio
 from typing import Dict
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 import uvicorn
 import stripe
+from fastapi.responses import HTMLResponse
+from contextlib import asynccontextmanager
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -200,7 +203,7 @@ CATALOGO_PRODUTOS = {
     },
 }
 
-# --- APLICATIVO DO TELEGRAM (Injetado em Tempo de Execução) ---
+# --- APLICATIVO DO TELEGRAM ---
 telegram_app: Application = None
 
 # --- HANDLERS DO BOT ---
@@ -250,7 +253,7 @@ async def comprarvip_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("⏳ Gerando seu link de checkout seguro via Stripe...")
     
     try:
-        session = stripe.checkout.sessions.create(
+        session = stripe.checkout.Session.create(
             line_items=[{
                 'price_data': {
                     'currency': 'brl',
@@ -269,7 +272,6 @@ async def comprarvip_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"Erro Stripe VIP: {e}")
         await update.message.reply_text("❌ Erro ao gerar link de pagamento.")
 
-# --- FLUXO DE LOJA COM INLINE KEYBOARDS (Melhor Experiência no Telegram) ---
 async def comprar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = []
     for cat_id, cat in CATALOGO_PRODUTOS.items():
@@ -323,7 +325,7 @@ async def loja_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(f"⏳ Gerando link de checkout para: *{produto['nome']}*...", parse_mode="Markdown")
         
         try:
-            session = stripe.checkout.sessions.create(
+            session = stripe.checkout.Session.create(
                 line_items=[{
                     'price_data': {
                         'currency': 'brl',
@@ -355,19 +357,51 @@ async def loja_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Erro Stripe Produto: {e}")
             await query.message.reply_text("❌ Erro ao processar o link de pagamento.")
 
-# --- API WEBHOOK COM FASTAPI ---
-app = FastAPI()
 
+# --- CONFIGURAÇÃO DO LIFESPAN DO FASTAPI (Instanciado antes de usar as rotas!) ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global telegram_app
+    # Inicializa o bot do Telegram usando a instância global de loop existente
+    telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    telegram_app.add_handler(CommandHandler("start", start_command))
+    telegram_app.add_handler(CommandHandler("ajuda", start_command))
+    telegram_app.add_handler(CommandHandler("status", status_command))
+    telegram_app.add_handler(CommandHandler("sobrevip", sobrevip_command))
+    telegram_app.add_handler(CommandHandler("comprarvip", comprarvip_command))
+    telegram_app.add_handler(CommandHandler("comprar", comprar_command))
+    telegram_app.add_handler(CallbackQueryHandler(loja_callback))
+    
+    await telegram_app.initialize()
+    await telegram_app.start()
+    await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot do Telegram inicializado com sucesso em segundo plano!")
+    
+    yield  # Mantém o FastAPI servindo as requisições HTTP do Webhook
+    
+    if telegram_app:
+        logger.info("Encerrando recursos assíncronos do Bot...")
+        await telegram_app.updater.stop()
+        await telegram_app.stop()
+        await telegram_app.shutdown()
+
+
+# --- DEFINIÇÃO DO APLICATIVO FASTAPI ---
+app = FastAPI(lifespan=lifespan)
+
+
+# --- ENTREGA ASSÍNCRONA ---
 async def enviar_entrega_assincrona(telegram_id: str, metadata: dict):
-    """Envia o conteúdo digital ou link de forma assíncrona para não travar o Webhook"""
     tipo_compra = metadata.get("tipo_compra")
     bot = telegram_app.bot
 
     if tipo_compra == "vip":
         update_user(telegram_id, {"is_vip": 1})
         await bot.send_message(
-            chat_id=telegram_id,
-            text="🎉 *PAGAMENTO APROVADO!* 🎉\n\nSeja muito bem-vindo ao VIP! Seu acesso vitalício está ativo. Digite `/sobrevip` para ver os detalhes."
+            chat_id=int(telegram_id),
+            text="🎉 *PAGAMENTO APROVADO!* 🎉\n\nSeja muito bem-vindo ao VIP! Seu acesso vitalício está ativo. Digite `/sobrevip` para ver os detalhes.",
+            parse_mode="Markdown"
         )
     elif tipo_compra == "produto":
         cat_id = metadata.get("category_id")
@@ -376,79 +410,84 @@ async def enviar_entrega_assincrona(telegram_id: str, metadata: dict):
         
         produto = CATALOGO_PRODUTOS.get(cat_id, {}).get('subcategorias', {}).get(sub_id, {}).get('produtos', {}).get(prod_id)
         if not produto:
-            await bot.send_message(chat_id=telegram_id, text="✅ Pagamento aprovado, mas houve um erro ao localizar seu produto. Chame o suporte!")
+            await bot.send_message(chat_id=int(telegram_id), text="✅ Pagamento aprovado, mas houve um erro ao localizar seu produto. Chame o suporte!")
             return
 
-        await bot.send_message(chat_id=telegram_id, text=f"🎉 *PAGAMENTO APROVADO!* 🎉\n\nEntrega iniciada para o produto: *{produto['nome']}*")
+        await bot.send_message(chat_id=int(telegram_id), text=f"🎉 *PAGAMENTO APROVADO!* 🎉\n\nEntrega iniciada para o produto: *{produto['nome']}*", parse_mode="Markdown")
         
         if produto['tipoEntrega'] == 'link':
-            await bot.send_message(chat_id=telegram_id, text=f"🔗 *Acesse seu produto aqui:*\n{produto['payload']}")
+            await bot.send_message(chat_id=int(telegram_id), text=f"🔗 *Acesse seu produto aqui:*\n{produto['payload']}")
         elif produto['tipoEntrega'] == 'arquivo':
             file_path = os.path.join(PRODUCTS_DIR, produto['payload'])
             if os.path.exists(file_path):
                 with open(file_path, 'rb') as f:
-                    await bot.send_document(chat_id=telegram_id, document=f, caption="📦 *Arquivo entregue com sucesso!* Bom proveito.")
+                    await bot.send_document(chat_id=int(telegram_id), document=f, caption="📦 *Arquivo entregue com sucesso!* Bom proveito.", write_timeout=60)
             else:
                 logger.error(f"Arquivo ausente: {file_path}")
-                await bot.send_message(chat_id=telegram_id, text="❌ *Erro interno:* O arquivo físico do produto não foi localizado no servidor. Contate o suporte.")
+                await bot.send_message(chat_id=int(telegram_id), text="❌ *Erro interno:* O arquivo físico do produto não foi localizado no servidor. Contate o suporte.")
 
+
+# --- ROTAS DA API DO WEBHOOK ---
 @app.post("/webhook")
-async def stripe_webhook(request: Request, background_tasks: BackgroundTasks):
-    payload = await request.body()
+async def stripe_webhook(request: Request):
+    # 1. Pega os bytes brutos do corpo da requisição
+    body_bytes = await request.body()
+    # 2. Converte para string pura UTF-8, essencial para bater o hash da assinatura
+    payload = body_bytes.decode("utf-8")
+    
     sig_header = request.headers.get("stripe-signature")
 
     try:
-        event = stripe.webhooks.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
+        # AQUI ESTÁ A SOLUÇÃO DEFINITIVA: Webhook com 'W' maiúsculo
+        event = stripe.Webhook.construct_event(payload, sig_header, STRIPE_WEBHOOK_SECRET)
     except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+        logger.error(f"Erro na validação do Webhook: {e}")
+        raise HTTPException(status_code=400, detail=f"Erro de assinatura: {str(e)}")
 
+    # 3. Processamento do evento igualzinho ao seu código em Node.js
     if event["type"] == "checkout.session.completed":
         session = event["data"]["object"]
         metadata = session.get("metadata", {})
         telegram_id = metadata.get("telegram_id")
         
         if telegram_id:
-            background_tasks.add_task(enviar_entrega_assincrona, telegram_id, metadata)
+            # Dispara a entrega em segundo plano para o FastAPI responder 200 OK imediatamente para a Stripe
+            asyncio.create_task(enviar_entrega_assincrona(telegram_id, metadata))
+            logger.info(f"Entrega agendada via asyncio com sucesso para o ID: {telegram_id}")
 
     return {"received": True}
 
-@app.get("/sucesso")
-def sucesso():
-    return "✅ Pagamento Aprovado! Você já pode voltar para o Telegram."
+@app.get("/sucesso", response_class=HTMLResponse)
+async def sucesso():
+    return """
+    <html>
+        <head>
+            <title>Sucesso</title>
+            <meta charset="utf-8">
+        </head>
+        <body style="font-family: sans-serif; text-align: center; padding: 50px; background-color: #121212; color: #ffffff;">
+            <h1 style="color: #2ecc71;">✅ Pagamento Aprovado!</h1>
+            <p style="font-size: 18px;">O seu produto ou acesso VIP já foi liberado no Telegram.</p>
+            <p style="color: #aaaaaa;">Você já pode fechar esta aba e retornar ao chat.</p>
+        </body>
+    </html>
+    """
 
-@app.get("/cancelado")
-def cancelado():
-    return "❌ Pagamento Cancelado."
-
-# --- INICIALIZAÇÃO EM PARALELO (Bot + FastAPI) ---
-@app.on_event("startup")
-async def startup_event():
-    global telegram_app
-    # Constrói a aplicação do bot do Telegram
-    telegram_app = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Handlers dos comandos básicos remanescentes
-    telegram_app.add_handler(CommandHandler("start", start_command))
-    telegram_app.add_handler(CommandHandler("ajuda", start_command))
-    telegram_app.add_handler(CommandHandler("status", status_command))
-    telegram_app.add_handler(CommandHandler("sobrevip", sobrevip_command))
-    telegram_app.add_handler(CommandHandler("comprarvip", comprarvip_command))
-    telegram_app.add_handler(CommandHandler("comprar", comprar_command))
-    
-    # Handler do menu interativo da loja
-    telegram_app.add_handler(CallbackQueryHandler(loja_callback))
-    
-    await telegram_app.initialize()
-    await telegram_app.start()
-    await telegram_app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-    logger.info("Bot do Telegram iniciado perfeitamente com Polling.")
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if telegram_app:
-        await telegram_app.updater.stop()
-        await telegram_app.stop()
-        await telegram_app.shutdown()
+@app.get("/cancelado", response_class=HTMLResponse)
+async def cancelado():
+    return """
+    <html>
+        <head>
+            <title>Cancelado</title>
+            <meta charset="utf-8">
+        </head>
+        <body style="font-family: sans-serif; text-align: center; padding: 50px; background-color: #121212; color: #ffffff;">
+            <h1 style="color: #e74c3c;">❌ Pagamento Cancelado</h1>
+            <p style="font-size: 18px;">A operação foi cancelada e nenhuma cobrança foi realizada.</p>
+            <p style="color: #aaaaaa;">Se precisar, basta iniciar o pedido novamente pelo menu do bot.</p>
+        </body>
+    </html>
+    """
 
 if __name__ == "__main__":
-    uvicorn.run("main.py:app", host="0.0.0.0", port=int(os.getenv("PORT", 80)), reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", 80)), reload=False)
